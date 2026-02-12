@@ -1,8 +1,8 @@
-import { useEffect, useCallback, useRef } from 'react';
+import { useCallback } from 'react';
 import useAssistantStore from '../store/useAssistantStore';
 import useTaskStore from '../store/useTaskStore';
 import taskApi from '../services/taskApi';
-import { connectSocket, disconnectSocket, getSocket } from '../services/socketService';
+import api from '../services/api';
 
 /** Refresh all task lists from the API */
 async function refreshAllTasks() {
@@ -19,7 +19,7 @@ async function refreshAllTasks() {
     store.setOverdueTasks(overdueRes.data);
     store.setStats(statsRes.data);
   } catch (err) {
-    console.error('[WS] Failed to refresh tasks:', err);
+    console.error('[Chat] Failed to refresh tasks:', err);
   }
 }
 
@@ -30,35 +30,28 @@ const TASK_REFRESH_ACTIONS = [
 ];
 
 export default function useWebSocket() {
-  const socketRef = useRef(null);
-  const { token, setConnectionStatus, addTranscriptEntry, setActiveReminder, setJarvisState } =
-    useAssistantStore();
+  const { addTranscriptEntry, setJarvisState } = useAssistantStore();
 
-  useEffect(() => {
-    if (!token) return;
+  // Mark as connected since we use REST (always "connected" when authenticated)
+  useAssistantStore.getState().setConnectionStatus('connected');
 
-    const socket = connectSocket(token);
-    socketRef.current = socket;
+  const sendVoiceInput = useCallback(async (text) => {
+    const sessionId = useAssistantStore.getState().sessionId;
 
-    socket.on('connect', () => {
-      setConnectionStatus('connected');
+    addTranscriptEntry({
+      role: 'user',
+      content: text,
+      timestamp: new Date().toISOString(),
     });
+    setJarvisState('processing');
 
-    socket.on('disconnect', () => {
-      setConnectionStatus('disconnected');
-    });
+    try {
+      const res = await api.post('/api/chat', {
+        text,
+        session_id: sessionId,
+      });
 
-    socket.on('reconnect_attempt', () => {
-      setConnectionStatus('reconnecting');
-    });
-
-    socket.on('system_status', (data) => {
-      console.log('[WS] System status:', data);
-    });
-
-    socket.on('ai_response', (data) => {
-      // Skip adding to transcript if it's a reminder (ReminderAlert handles its own voice loop)
-      if (data.session_id === 'reminders') return;
+      const data = res.data;
 
       addTranscriptEntry({
         role: 'assistant',
@@ -67,70 +60,39 @@ export default function useWebSocket() {
         action: data.action,
         timestamp: new Date().toISOString(),
       });
-      // Don't force 'speaking' here — let TTS onstart set it.
-      // This prevents state getting stuck at 'speaking' if TTS fails silently.
 
-      // If the AI performed a task-related action, refresh the task panels immediately
+      // If the AI performed a task-related action, refresh task panels
       const actionName = data.action?.action;
       if (actionName && TASK_REFRESH_ACTIONS.includes(actionName)) {
         refreshAllTasks();
       }
-    });
-
-    socket.on('task_updated', (data) => {
-      // Optimistic remove for deletions, then full refresh for everything
-      if (data.action === 'task_deleted' || data.action === 'task_cancelled') {
-        useTaskStore.getState().removeTask(data.task_id);
-      }
-      // Always refresh to sync UI with latest DB state
-      refreshAllTasks();
-    });
-
-    socket.on('reminder_alert', (data) => {
-      setActiveReminder(data);
-      setJarvisState('alert');
-    });
-
-    socket.on('reminder_dismissed', () => {
-      useAssistantStore.getState().dismissReminder();
-    });
-
-    socket.on('pong', () => {
-      // Connection alive
-    });
-
-    return () => {
-      disconnectSocket();
-      setConnectionStatus('disconnected');
-    };
-  }, [token]);
-
-  const sendVoiceInput = useCallback((text) => {
-    const socket = getSocket();
-    const sessionId = useAssistantStore.getState().sessionId;
-    if (socket?.connected) {
+    } catch (err) {
+      console.error('[Chat] API error:', err);
       addTranscriptEntry({
-        role: 'user',
-        content: text,
+        role: 'assistant',
+        content: 'I apologize, sir. I\'m having trouble connecting to my servers. Please try again.',
+        emotion: 'concerned',
         timestamp: new Date().toISOString(),
       });
-      socket.emit('voice_input', { text, session_id: sessionId });
-      setJarvisState('processing');
+      setJarvisState('idle');
     }
   }, []);
 
-  const sendTaskAction = useCallback((action, taskId) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('task_action', { action, task_id: taskId });
+  const sendTaskAction = useCallback(async (action, taskId) => {
+    if (action === 'complete' && taskId) {
+      try {
+        await taskApi.updateStatus(taskId, 'done');
+        refreshAllTasks();
+      } catch (err) {
+        console.error('[Chat] Task action error:', err);
+      }
     }
   }, []);
 
   const sendReminderResponse = useCallback((action, taskId) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('reminder_response', { action, task_id: taskId });
-    }
+    // Reminders require WebSocket (not available on Vercel)
+    // Handle locally — just dismiss
+    console.log(`[Reminder] ${action} for task ${taskId} (local only)`);
   }, []);
 
   return { sendVoiceInput, sendTaskAction, sendReminderResponse };
