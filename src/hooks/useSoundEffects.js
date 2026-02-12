@@ -43,7 +43,7 @@ export default function useSoundEffects() {
         sounds[key] = new Howl({
           src: [`/sounds/${key}.mp3`],
           volume: soundsVolume,
-          preload: true,
+          preload: false,
           onloaderror: (_id, err) => {
             console.warn(
               `[useSoundEffects] Could not load sound "${key}": ${err || 'file not found'}. Continuing without it.`
